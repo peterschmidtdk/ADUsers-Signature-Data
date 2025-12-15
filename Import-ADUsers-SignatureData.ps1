@@ -8,13 +8,15 @@
       - If a column is NOT in the CSV, that attribute is left unchanged.
     By default:
       - Does NOT clear attributes when CSV value is blank ($AllowClearing = $false).
+    Logging:
+      - Writes a timestamped .log and a detailed change .csv (planned/applied/failed).
 
 .NOTES
     Author  : Peter
     Script  : Import-ADUsers-SignatureData.ps1
-    Version : 1.3
+    Version : 1.4
     Updated : 2025-12-15
-    Output  : Defaults to .\
+    Output  : Defaults to .\Logs (for logs)
 
 .REQUIREMENTS
     - RSAT ActiveDirectory module
@@ -22,16 +24,23 @@
 #>
 
 # -----------------------------
+# Make relative paths predictable
+# -----------------------------
+try { Set-Location -Path $PSScriptRoot } catch { }
+
+# -----------------------------
 # Config
 # -----------------------------
-$CsvPath           = ".\AD_Users_SignatureData_Export_YYYY-MM-dd_HH-mm-ss.csv"
+$CsvPath           = ".\AD_Users_SignatureData_import_us.csv"
 $LogDirectory      = ".\Logs"
+
 $WhatIfMode        = $false     # true = log intended changes only (no Set-ADUser calls)
 $AllowClearing     = $false     # true = if CSV field is blank (AND column exists), clear the AD attribute
-$UpdateMailAttr    = $true      # true = set AD 'mail' to CSV Email (when different, only if Email column exists)
-$UpdateProxyAddrs  = $true      # true = update proxyAddresses logic (only if Email/ProxyAddresses columns exist)
-$UpdateManager     = $true      # true = try to set manager from CSV (only if Manager/Manager Email columns exist)
-$AddCsvProxyAddrs  = $true      # true = add addresses from CSV "ProxyAddresses" (never removes existing)
+
+$UpdateMailAttr    = $true      # only if Email column exists
+$UpdateProxyAddrs  = $true      # only if Email/ProxyAddresses columns exist
+$UpdateManager     = $true      # only if Manager or Manager Email columns exist
+$AddCsvProxyAddrs  = $true      # add addresses from CSV "ProxyAddresses" (never removes existing)
 
 # Match order for identifying the user in AD
 $IdentityMatchOrder = @('SamAccountName','UPN','Email')
@@ -107,7 +116,9 @@ function Resolve-TargetUser {
 
         try {
             switch ($key) {
-                'SamAccountName' { return (Get-ADUser -Identity $val -Properties * -ErrorAction Stop) }
+                'SamAccountName' {
+                    return (Get-ADUser -Identity $val -Properties * -ErrorAction Stop)
+                }
                 'UPN' {
                     $u = Get-ADUser -Filter "UserPrincipalName -eq '$val'" -Properties * -ErrorAction Stop
                     if ($u) { return $u }
@@ -158,18 +169,21 @@ function Ensure-ProxyAddresses {
 
     $primaryEmail = (Normalize-String $PrimaryEmail).ToLowerInvariant()
 
+    # Ensure only ONE primary SMTP, and it matches Email (if Email column exists/provided)
     if (-not [string]::IsNullOrWhiteSpace($primaryEmail)) {
         $newList = @()
         foreach ($p in $existingList) {
-            if ($p -like 'SMTP:*') { $newList += ('smtp:' + ($p.Substring(5))) }
-            else { $newList += $p }
+            if ($p -like 'SMTP:*') { $newList += ('smtp:' + ($p.Substring(5))) } else { $newList += $p }
         }
 
         $desiredPrimary = "SMTP:$primaryEmail"
+
+        # If desired exists as smtp:, promote it
         $newList = $newList | ForEach-Object {
             if ($_.ToLowerInvariant() -eq ("smtp:$primaryEmail")) { $desiredPrimary } else { $_ }
         }
 
+        # Ensure desired primary exists
         if (-not ($newList | Where-Object { $_.ToLowerInvariant() -eq $desiredPrimary.ToLowerInvariant() })) {
             $newList += $desiredPrimary
         }
@@ -177,6 +191,7 @@ function Ensure-ProxyAddresses {
         $existingList = $newList
     }
 
+    # Add any CSV proxies (never remove)
     foreach ($p in $CsvProxyAddresses) {
         $pp = Normalize-String $p
         if ([string]::IsNullOrWhiteSpace($pp)) { continue }
@@ -187,6 +202,7 @@ function Ensure-ProxyAddresses {
         }
     }
 
+    # De-dupe case-insensitive
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $deduped = foreach ($p in $existingList) { if ($seen.Add($p)) { $p } }
 
@@ -194,20 +210,75 @@ function Ensure-ProxyAddresses {
 }
 
 # -----------------------------
-# Validate input
+# Friendly CSV path validation (no stack trace)
 # -----------------------------
-if (-not (Test-Path $CsvPath)) { throw "CSV file not found: $CsvPath" }
+$ResolvedCsvPath = $null
+try { $ResolvedCsvPath = (Resolve-Path -Path $CsvPath -ErrorAction Stop).Path } catch { }
 
+if (-not $ResolvedCsvPath -or -not (Test-Path -Path $ResolvedCsvPath -PathType Leaf)) {
+
+    $cwd = (Get-Location).Path
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Yellow
+    Write-Host "IMPORT FAILED: CSV file not found" -ForegroundColor Yellow
+    Write-Host "========================================" -ForegroundColor Yellow
+    Write-Host "The script expected this CSV file:" -ForegroundColor Yellow
+    Write-Host "  $CsvPath" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Current working folder:" -ForegroundColor Yellow
+    Write-Host "  $cwd" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Tips:" -ForegroundColor Yellow
+    Write-Host "  - If you use a relative path like .\file.csv, it is relative to the working folder above."
+    Write-Host "  - Try setting CsvPath to a full path, e.g. C:\Scripts\ExportADinfo\file.csv"
+    Write-Host ""
+
+    $candidates = Get-ChildItem -Path $cwd -Filter "*.csv" -File -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending |
+                  Select-Object -First 10
+
+    if ($candidates) {
+        Write-Host "CSV files found in the working folder (newest first):" -ForegroundColor Yellow
+        foreach ($c in $candidates) {
+            Write-Host ("  {0}  ({1})" -f $c.Name, $c.LastWriteTime) -ForegroundColor Yellow
+        }
+        Write-Host ""
+    } else {
+        Write-Host "No CSV files were found in the working folder." -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    try { Write-Log "IMPORT FAILED: CSV file not found: $CsvPath (WorkingFolder: $cwd)" "ERROR" } catch { }
+
+    Write-Host "Stopping. Fix CsvPath and run again." -ForegroundColor Yellow
+    Write-Host ""
+    return
+}
+
+$CsvPath = $ResolvedCsvPath
+
+# -----------------------------
+# Load CSV
+# -----------------------------
 Write-Log "Starting import. CSV: $CsvPath"
 Write-Log "WhatIfMode=$WhatIfMode | AllowClearing=$AllowClearing | UpdateMailAttr=$UpdateMailAttr | UpdateProxyAddrs=$UpdateProxyAddrs | UpdateManager=$UpdateManager"
 
 $rows = Import-Csv -Path $CsvPath
 $rows = @($rows)  # ensure array even for single-row CSV
-if (-not $rows -or $rows.Count -eq 0) { throw "CSV is empty: $CsvPath" }
+if (-not $rows -or $rows.Count -eq 0) {
+    Write-Log "IMPORT FAILED: CSV is empty: $CsvPath" "ERROR"
+    Write-Host ""
+    Write-Host "IMPORT FAILED: The CSV file is empty:" -ForegroundColor Yellow
+    Write-Host "  $CsvPath" -ForegroundColor Yellow
+    Write-Host ""
+    return
+}
 
 $rowCount = $rows.Count
 if ($rowCount -lt 1) { $rowCount = 1 }
 
+# Build CSV header set
 $HeaderSet = @{}
 $rows[0].PSObject.Properties.Name | ForEach-Object { $HeaderSet[$_] = $true }
 
@@ -238,7 +309,7 @@ foreach ($r in $rows) {
     if ($pct -lt 0)   { $pct = 0 }
 
     Write-Progress -Activity "Importing users" -Status ("Processing {0} / {1}: {2}" -f $processed, $rowCount, $idDisplay) -PercentComplete $pct
-    Write-Log "Processing: $idDisplay"
+    Write-Host ("[{0}/{1}] {2}" -f $processed, $rowCount, $idDisplay)
 
     try {
         $u = Resolve-TargetUser -Row $r
@@ -256,6 +327,7 @@ foreach ($r in $rows) {
         $planSetManager = $false
         $mgrDn = $null
 
+        # Map CSV columns -> AD attribute names (ONLY if column exists)
         $map = @(
             @{ Csv='First Name';     Ad='givenName' },
             @{ Csv='Last Name';      Ad='sn' },
@@ -325,6 +397,7 @@ foreach ($r in $rows) {
             }
         }
 
+        # otherTelephone (multi-valued) only if column exists
         if (Csv-HasColumn 'Other phones') {
             $csvOtherPhones = Split-SemicolonList (Normalize-String $r.'Other phones')
             $adOtherPhones  = @()
@@ -338,13 +411,13 @@ foreach ($r in $rows) {
                     $replace['otherTelephone'] = $csvOtherPhones
                     Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName -Attribute 'otherTelephone' -OldValue ($adOtherPhones -join ';') -NewValue ($csvOtherPhones -join ';') -Action "Replace" -Status "Planned" -Note "Multi-valued"
                 }
-            }
-            elseif ($AllowClearing -and $adOtherPhones.Count -gt 0) {
+            } elseif ($AllowClearing -and $adOtherPhones.Count -gt 0) {
                 $clear += 'otherTelephone'
                 Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName -Attribute 'otherTelephone' -OldValue ($adOtherPhones -join ';') -NewValue "" -Action "Clear" -Status "Planned" -Note "CSV blank and AllowClearing enabled"
             }
         }
 
+        # Email / mail only if Email column exists
         $csvEmail = ""
         if (Csv-HasColumn 'Email') { $csvEmail = Normalize-String $r.Email }
 
@@ -355,13 +428,13 @@ foreach ($r in $rows) {
                     $replace['mail'] = $csvEmail
                     Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName -Attribute 'mail' -OldValue $adMail -NewValue $csvEmail -Action "Replace" -Status "Planned" -Note ""
                 }
-            }
-            elseif ($AllowClearing -and -not [string]::IsNullOrWhiteSpace((Normalize-String $u.mail))) {
+            } elseif ($AllowClearing -and -not [string]::IsNullOrWhiteSpace((Normalize-String $u.mail))) {
                 $clear += 'mail'
                 Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName -Attribute 'mail' -OldValue (Normalize-String $u.mail) -NewValue "" -Action "Clear" -Status "Planned" -Note "CSV blank and AllowClearing enabled"
             }
         }
 
+        # proxyAddresses only if Email/ProxyAddresses columns exist
         $proxyRelevant = (Csv-HasColumn 'Email') -or (Csv-HasColumn 'ProxyAddresses')
         if ($UpdateProxyAddrs -and $proxyRelevant) {
             $existingProxies = @()
@@ -383,6 +456,7 @@ foreach ($r in $rows) {
             }
         }
 
+        # manager only if relevant columns exist
         $mgrRelevant = (Csv-HasColumn 'Manager') -or (Csv-HasColumn 'Manager Email')
         if ($UpdateManager -and $mgrRelevant) {
             $mgrDn = Resolve-ManagerDn -Row $r -HeaderSet $HeaderSet
@@ -412,6 +486,7 @@ foreach ($r in $rows) {
             continue
         }
 
+        # Apply Replace/Clear
         if ($replace.Count -gt 0 -or $clear.Count -gt 0) {
             $params = @{ Identity = $u.DistinguishedName; ErrorAction = 'Stop' }
             if ($replace.Count -gt 0) { $params['Replace'] = $replace }
@@ -419,6 +494,7 @@ foreach ($r in $rows) {
             Set-ADUser @params
         }
 
+        # Apply Manager
         if ($planSetManager -and $mgrDn) {
             Set-ADUser -Identity $u.DistinguishedName -Manager $mgrDn -ErrorAction Stop
         }
@@ -439,12 +515,18 @@ foreach ($r in $rows) {
 
 Write-Progress -Activity "Importing users" -Completed
 
+# -----------------------------
+# Write change CSV
+# -----------------------------
 if ($changeRows.Count -gt 0) {
     $changeRows | Export-Csv -Path $LogCsvPath -NoTypeInformation -Encoding UTF8
 } else {
     "Timestamp,SamAccountName,UPN,Attribute,OldValue,NewValue,Action,Status,Note" | Set-Content -Path $LogCsvPath -Encoding UTF8
 }
 
+# -----------------------------
+# Summary
+# -----------------------------
 Write-Log "Run complete."
 Write-Log "Processed : $processed"
 Write-Log "Matched   : $matched"
