@@ -303,4 +303,328 @@ if (-not $hasAnyIdColumn) {
     Write-Host ("  {0}" -f $found) -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Most common cause: wrong delimiter (Excel often uses ';' in DK)." -ForegroundColor Yellow
-    Write-Host ("Delimiter used: '{0}'" -f ($CsvDelimiter -replace "
+    Write-Host ("Delimiter used: '{0}'" -f ($CsvDelimiter -replace "`t", "\t")) -ForegroundColor Yellow
+    Write-Host ""
+    Write-Log ("IMPORT FAILED: No identity columns found. ColumnsFound=[{0}]" -f $found) "ERROR"
+    return
+}
+
+function Resolve-TargetUser {
+    param([pscustomobject]$Row)
+
+    foreach ($key in $IdentityMatchOrder) {
+        $val = Get-CsvValue -Row $Row -ColumnName $key
+        if ([string]::IsNullOrWhiteSpace($val)) { continue }
+
+        try {
+            switch ($key) {
+                'SamAccountName' { return (Get-ADUser -Identity $val -Properties * -ErrorAction Stop) }
+                'UPN' {
+                    $u = Get-ADUser -Filter "UserPrincipalName -eq '$val'" -Properties * -ErrorAction Stop
+                    if ($u) { return $u }
+                }
+                'Email' {
+                    $u = Get-ADUser -Filter "mail -eq '$val'" -Properties * -ErrorAction Stop
+                    if ($u) { return $u }
+                }
+            }
+        } catch { }
+    }
+
+    return $null
+}
+
+function Resolve-ManagerDn {
+    param([pscustomobject]$Row)
+
+    if (Csv-HasColumn 'Manager Email') {
+        $mgrEmail = Get-CsvValue -Row $Row -ColumnName 'Manager Email'
+        if (-not [string]::IsNullOrWhiteSpace($mgrEmail)) {
+            $m = Get-ADUser -Filter "mail -eq '$mgrEmail'" -Properties DistinguishedName -ErrorAction SilentlyContinue
+            if ($m) { return $m.DistinguishedName }
+        }
+    }
+
+    if (Csv-HasColumn 'Manager') {
+        $mgrName = Get-CsvValue -Row $Row -ColumnName 'Manager'
+        if (-not [string]::IsNullOrWhiteSpace($mgrName)) {
+            $cands = Get-ADUser -Filter "DisplayName -eq '$mgrName'" -Properties DistinguishedName -ErrorAction SilentlyContinue
+            if ($cands.Count -eq 1) { return $cands[0].DistinguishedName }
+        }
+    }
+
+    return $null
+}
+
+# -----------------------------
+# Import loop
+# -----------------------------
+$processed = 0
+$matched   = 0
+$updated   = 0
+$skipped   = 0
+$errors    = 0
+
+foreach ($r in $rows) {
+
+    $processed++
+
+    $idDisplay = Get-CsvValue -Row $r -ColumnName 'SamAccountName'
+    if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = Get-CsvValue -Row $r -ColumnName 'UPN' }
+    if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = Get-CsvValue -Row $r -ColumnName 'Email' }
+    if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = "(no id in row)" }
+
+    $pct = [int](($processed / $rowCount) * 100)
+    if ($pct -gt 100) { $pct = 100 }
+    if ($pct -lt 0)   { $pct = 0 }
+
+    Write-Progress -Activity "Importing users" -Status ("Processing {0} / {1}: {2}" -f $processed, $rowCount, $idDisplay) -PercentComplete $pct
+    Write-Host ("[{0}/{1}] {2}" -f $processed, $rowCount, $idDisplay)
+
+    try {
+
+        $u = Resolve-TargetUser -Row $r
+        if (-not $u) {
+            $skipped++
+            Write-Log ("User not found in AD for row identity: {0}" -f $idDisplay) "WARN"
+            Add-ChangeRow -SamAccountName (Get-CsvValue -Row $r -ColumnName 'SamAccountName') `
+                          -UPN            (Get-CsvValue -Row $r -ColumnName 'UPN') `
+                          -Attribute      "(identity)" `
+                          -OldValue       "" `
+                          -NewValue       "" `
+                          -Action         "Skip" `
+                          -Status         "NotFound" `
+                          -Note           "No matching AD user"
+            continue
+        }
+
+        $matched++
+
+        $replace = @{}
+        $clear   = New-Object System.Collections.Generic.List[string]
+        $planSetManager = $false
+        $mgrDn = $null
+
+        # Column -> AD attribute map (ONLY applied if column exists)
+        $map = @(
+            @{ Csv='First Name';     Ad='givenName' },
+            @{ Csv='Last Name';      Ad='sn' },
+            @{ Csv='Initials';       Ad='initials' },
+
+            @{ Csv='Company';        Ad='company' },
+            @{ Csv='Department';     Ad='department' },
+            @{ Csv='Office';         Ad='physicalDeliveryOfficeName' },
+            @{ Csv='Position';       Ad='title' },
+            @{ Csv='Description';    Ad='description' },
+            @{ Csv='Notes';          Ad='info' },
+
+            @{ Csv='Street';         Ad='streetAddress' },
+            @{ Csv='P.O. Box';       Ad='postOfficeBox' },
+            @{ Csv='City';           Ad='l' },
+            @{ Csv='State';          Ad='st' },
+            @{ Csv='Postal code';    Ad='postalCode' },
+            @{ Csv='Country (c)';    Ad='c' },
+            @{ Csv='Country (co)';   Ad='co' },
+
+            @{ Csv='Phone';          Ad='telephoneNumber' },
+            @{ Csv='Mobile';         Ad='mobile' },
+            @{ Csv='IP phone';       Ad='ipPhone' },
+            @{ Csv='Home phone';     Ad='homePhone' },
+            @{ Csv='Fax';            Ad='facsimileTelephoneNumber' },
+            @{ Csv='Pager';          Ad='pager' },
+            @{ Csv='Web page';       Ad='wWWHomePage' },
+
+            @{ Csv='EmployeeID';     Ad='employeeID' },
+            @{ Csv='EmployeeNumber'; Ad='employeeNumber' },
+            @{ Csv='EmployeeType';   Ad='employeeType' },
+
+            @{ Csv='ExchAttr1';      Ad='extensionAttribute1' },
+            @{ Csv='ExchAttr2';      Ad='extensionAttribute2' },
+            @{ Csv='ExchAttr3';      Ad='extensionAttribute3' },
+            @{ Csv='ExchAttr4';      Ad='extensionAttribute4' },
+            @{ Csv='ExchAttr5';      Ad='extensionAttribute5' },
+            @{ Csv='ExchAttr6';      Ad='extensionAttribute6' },
+            @{ Csv='ExchAttr7';      Ad='extensionAttribute7' },
+            @{ Csv='ExchAttr8';      Ad='extensionAttribute8' },
+            @{ Csv='ExchAttr9';      Ad='extensionAttribute9' },
+            @{ Csv='ExchAttr10';     Ad='extensionAttribute10' },
+            @{ Csv='ExchAttr11';     Ad='extensionAttribute11' },
+            @{ Csv='ExchAttr12';     Ad='extensionAttribute12' },
+            @{ Csv='ExchAttr13';     Ad='extensionAttribute13' },
+            @{ Csv='ExchAttr14';     Ad='extensionAttribute14' },
+            @{ Csv='ExchAttr15';     Ad='extensionAttribute15' }
+        )
+
+        foreach ($m in $map) {
+
+            if (-not (Csv-HasColumn $m.Csv)) { continue }
+
+            $csvVal = Get-CsvValue -Row $r -ColumnName $m.Csv
+            $adVal  = Normalize-String $u.($m.Ad)
+
+            if ([string]::IsNullOrWhiteSpace($csvVal)) {
+                if ($AllowClearing -and -not [string]::IsNullOrWhiteSpace($adVal)) {
+                    $null = $clear.Add($m.Ad)
+                    Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                        -Attribute $m.Ad -OldValue $adVal -NewValue "" -Action "Clear" -Status "Planned" -Note "CSV blank + AllowClearing"
+                }
+                continue
+            }
+
+            if ($csvVal -ne $adVal) {
+                $replace[$m.Ad] = $csvVal
+                Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                    -Attribute $m.Ad -OldValue $adVal -NewValue $csvVal -Action "Replace" -Status "Planned" -Note ""
+            }
+        }
+
+        # Other phones (otherTelephone) multi-valued
+        if (Csv-HasColumn 'Other phones') {
+            $csvOther = Split-SemicolonList (Get-CsvValue -Row $r -ColumnName 'Other phones')
+            $adOther  = @()
+            if ($u.otherTelephone) { $adOther = @($u.otherTelephone) }
+
+            if ($csvOther.Count -gt 0) {
+                $csvNorm = ($csvOther | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join '|'
+                $adNorm  = ($adOther  | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join '|'
+                if ($csvNorm -ne $adNorm) {
+                    $replace['otherTelephone'] = $csvOther
+                    Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                        -Attribute 'otherTelephone' -OldValue ($adOther -join ';') -NewValue ($csvOther -join ';') -Action "Replace" -Status "Planned" -Note "Multi-valued"
+                }
+            } elseif ($AllowClearing -and $adOther.Count -gt 0) {
+                $null = $clear.Add('otherTelephone')
+                Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                    -Attribute 'otherTelephone' -OldValue ($adOther -join ';') -NewValue "" -Action "Clear" -Status "Planned" -Note "CSV blank + AllowClearing"
+            }
+        }
+
+        # mail (from Email column)
+        $csvEmail = ""
+        if (Csv-HasColumn 'Email') { $csvEmail = Get-CsvValue -Row $r -ColumnName 'Email' }
+
+        if ($UpdateMailAttr -and (Csv-HasColumn 'Email')) {
+            $adMail = Normalize-String $u.mail
+            if (-not [string]::IsNullOrWhiteSpace($csvEmail)) {
+                if ($csvEmail -ne $adMail) {
+                    $replace['mail'] = $csvEmail
+                    Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                        -Attribute 'mail' -OldValue $adMail -NewValue $csvEmail -Action "Replace" -Status "Planned" -Note ""
+                }
+            } elseif ($AllowClearing -and -not [string]::IsNullOrWhiteSpace($adMail)) {
+                $null = $clear.Add('mail')
+                Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                    -Attribute 'mail' -OldValue $adMail -NewValue "" -Action "Clear" -Status "Planned" -Note "CSV blank + AllowClearing"
+            }
+        }
+
+        # proxyAddresses
+        $proxyRelevant = (Csv-HasColumn 'Email') -or (Csv-HasColumn 'ProxyAddresses')
+        if ($UpdateProxyAddrs -and $proxyRelevant) {
+
+            $existing = @()
+            if ($u.proxyAddresses) { $existing = @($u.proxyAddresses) }
+
+            $csvProxies = @()
+            if ($AddCsvProxyAddrs -and (Csv-HasColumn 'ProxyAddresses')) {
+                $csvProxies = Split-SemicolonList (Get-CsvValue -Row $r -ColumnName 'ProxyAddresses')
+            }
+
+            $newProxies = Ensure-ProxyAddresses -Existing $existing -PrimaryEmail $csvEmail -CsvProxyAddresses $csvProxies
+
+            $oldNorm = ($existing  | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join '|'
+            $newNorm = ($newProxies| ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join '|'
+
+            if ($oldNorm -ne $newNorm) {
+                $replace['proxyAddresses'] = $newProxies
+                Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                    -Attribute 'proxyAddresses' -OldValue ($existing -join ';') -NewValue ($newProxies -join ';') -Action "Replace" -Status "Planned" -Note "Keeps existing; enforces primary SMTP when Email is present"
+            }
+        }
+
+        # manager
+        $mgrRelevant = (Csv-HasColumn 'Manager') -or (Csv-HasColumn 'Manager Email')
+        if ($UpdateManager -and $mgrRelevant) {
+            $mgrDn = Resolve-ManagerDn -Row $r
+            if ($mgrDn) {
+                $oldMgr = Normalize-String $u.manager
+                if ($mgrDn -ne $oldMgr) {
+                    $planSetManager = $true
+                    Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                        -Attribute 'manager' -OldValue $oldMgr -NewValue $mgrDn -Action "Set" -Status "Planned" -Note "Resolved manager DN"
+                }
+            } else {
+                Write-Log ("Manager could not be uniquely resolved for {0}. Skipping manager update." -f $u.SamAccountName) "WARN"
+                Add-ChangeRow -SamAccountName $u.SamAccountName -UPN $u.UserPrincipalName `
+                    -Attribute 'manager' -OldValue (Normalize-String $u.manager) -NewValue "" -Action "Skip" -Status "Unresolved" -Note "Manager not uniquely resolvable"
+            }
+        }
+
+        $hasChanges = ($replace.Count -gt 0) -or ($clear.Count -gt 0) -or $planSetManager
+
+        if (-not $hasChanges) {
+            $skipped++
+            Write-Log ("No changes needed for {0}." -f $u.SamAccountName) "INFO"
+            continue
+        }
+
+        if ($WhatIfMode) {
+            $updated++
+            Write-Log ("WhatIfMode: would update {0} (Replace={1}, Clear={2}, Manager={3})." -f $u.SamAccountName, $replace.Count, $clear.Count, $planSetManager) "CHANGE"
+            continue
+        }
+
+        # Apply Replace/Clear
+        if ($replace.Count -gt 0 -or $clear.Count -gt 0) {
+            $params = @{ Identity = $u.DistinguishedName; ErrorAction = 'Stop' }
+            if ($replace.Count -gt 0) { $params['Replace'] = $replace }
+            if ($clear.Count   -gt 0) { $params['Clear']   = @($clear) }
+            Set-ADUser @params
+        }
+
+        # Apply Manager
+        if ($planSetManager -and $mgrDn) {
+            Set-ADUser -Identity $u.DistinguishedName -Manager $mgrDn -ErrorAction Stop
+        }
+
+        $updated++
+        Write-Log ("Updated {0}." -f $u.SamAccountName) "CHANGE"
+
+        foreach ($cr in $changeRows | Where-Object { $_.SamAccountName -eq $u.SamAccountName -and $_.Status -eq 'Planned' }) {
+            $cr.Status = 'Applied'
+        }
+
+    } catch {
+
+        $errors++
+        Write-Log ("Error processing {0}: {1}" -f $idDisplay, $_.Exception.Message) "ERROR"
+        Add-ChangeRow -SamAccountName (Get-CsvValue -Row $r -ColumnName 'SamAccountName') `
+                      -UPN            (Get-CsvValue -Row $r -ColumnName 'UPN') `
+                      -Attribute      "(row)" `
+                      -OldValue       "" `
+                      -NewValue       "" `
+                      -Action         "Error" `
+                      -Status         "Failed" `
+                      -Note           $_.Exception.Message
+    }
+}
+
+Write-Progress -Activity "Importing users" -Completed
+
+# -----------------------------
+# Write change CSV + Summary
+# -----------------------------
+if ($changeRows.Count -gt 0) {
+    $changeRows | Export-Csv -Path $LogCsvPath -NoTypeInformation -Encoding UTF8
+} else {
+    "Timestamp,SamAccountName,UPN,Attribute,OldValue,NewValue,Action,Status,Note" | Set-Content -Path $LogCsvPath -Encoding UTF8
+}
+
+Write-Log "Run complete."
+Write-Log ("Processed : {0}" -f $processed)
+Write-Log ("Matched   : {0}" -f $matched)
+Write-Log ("Updated   : {0}" -f $updated)
+Write-Log ("Skipped   : {0}" -f $skipped)
+Write-Log ("Errors    : {0}" -f $errors)
+Write-Log ("Log (text): {0}" -f $LogTextPath)
+Write-Log ("Log (csv) : {0}" -f $LogCsvPath)
