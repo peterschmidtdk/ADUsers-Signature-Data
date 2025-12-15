@@ -18,13 +18,17 @@
       - If a column is NOT in the CSV, that attribute is left unchanged.
       - By default, blank CSV values do NOT clear AD attributes ($AllowClearing = $false).
 
+    CSV robustness:
+      - Auto-detects delimiter (comma/semicolon/tab) to handle Excel regional CSV formats.
+      - Trims header names to avoid issues with accidental whitespace in column names.
+
     Logging:
       - Writes a timestamped .log and a detailed change .csv (planned/applied/failed) for traceability.
 
 .NOTES
     Author  : Peter
     Script  : Import-ADUsers-SignatureData.ps1
-    Version : 1.5
+    Version : 1.6
     Updated : 2025-12-15
     Output  : Defaults to .\Logs (for logs)
 
@@ -33,9 +37,6 @@
     - CSV must include at least: SamAccountName OR UPN OR Email
 #>
 
-# -----------------------------
-# Make relative paths predictable
-# -----------------------------
 try { Set-Location -Path $PSScriptRoot } catch { }
 
 # -----------------------------
@@ -51,6 +52,9 @@ $UpdateMailAttr    = $true      # only if Email column exists
 $UpdateProxyAddrs  = $true      # only if Email/ProxyAddresses columns exist
 $UpdateManager     = $true      # only if Manager or Manager Email columns exist
 $AddCsvProxyAddrs  = $true      # add addresses from CSV "ProxyAddresses" (never removes existing)
+
+# If you want to override autodetect, set explicitly e.g. ';' or ','
+$CsvDelimiter      = $null
 
 # Match order for identifying the user in AD
 $IdentityMatchOrder = @('SamAccountName','UPN','Email')
@@ -117,11 +121,148 @@ function Split-SemicolonList {
     return $v.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 }
 
+function Get-DetectedDelimiter {
+    param([string]$Path)
+
+    # Read the first non-empty line (header)
+    $lines = Get-Content -Path $Path -TotalCount 50 -ErrorAction Stop
+    $header = ($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+
+    if (-not $header) { return ',' }
+
+    $comma = ([regex]::Matches($header, ',')).Count
+    $semi  = ([regex]::Matches($header, ';')).Count
+    $tab   = ([regex]::Matches($header, "`t")).Count
+
+    # Pick the delimiter with the most occurrences
+    $max = ($comma, $semi, $tab | Measure-Object -Maximum).Maximum
+    if ($max -eq 0) { return ',' }
+
+    if ($semi -eq $max) { return ';' }
+    if ($tab  -eq $max) { return "`t" }
+    return ','
+}
+
+# -----------------------------
+# Friendly CSV path validation (no stack trace)
+# -----------------------------
+$ResolvedCsvPath = $null
+try { $ResolvedCsvPath = (Resolve-Path -Path $CsvPath -ErrorAction Stop).Path } catch { }
+
+if (-not $ResolvedCsvPath -or -not (Test-Path -Path $ResolvedCsvPath -PathType Leaf)) {
+
+    $cwd = (Get-Location).Path
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Yellow
+    Write-Host "IMPORT FAILED: CSV file not found" -ForegroundColor Yellow
+    Write-Host "========================================" -ForegroundColor Yellow
+    Write-Host "The script expected this CSV file:" -ForegroundColor Yellow
+    Write-Host "  $CsvPath" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Current working folder:" -ForegroundColor Yellow
+    Write-Host "  $cwd" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Tips:" -ForegroundColor Yellow
+    Write-Host "  - If you use .\file.csv, it is relative to the working folder above."
+    Write-Host "  - Try setting CsvPath to a full path, e.g. C:\Scripts\ExportADinfo\file.csv"
+    Write-Host ""
+
+    $candidates = Get-ChildItem -Path $cwd -Filter "*.csv" -File -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending |
+                  Select-Object -First 10
+
+    if ($candidates) {
+        Write-Host "CSV files found in the working folder (newest first):" -ForegroundColor Yellow
+        foreach ($c in $candidates) { Write-Host ("  {0}  ({1})" -f $c.Name, $c.LastWriteTime) -ForegroundColor Yellow }
+        Write-Host ""
+    } else {
+        Write-Host "No CSV files were found in the working folder." -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    try { Write-Log "IMPORT FAILED: CSV file not found: $CsvPath (WorkingFolder: $cwd)" "ERROR" } catch { }
+    Write-Host "Stopping. Fix CsvPath and run again." -ForegroundColor Yellow
+    Write-Host ""
+    return
+}
+
+$CsvPath = $ResolvedCsvPath
+
+# -----------------------------
+# Load CSV (with delimiter autodetect)
+# -----------------------------
+if (-not $CsvDelimiter) {
+    $CsvDelimiter = Get-DetectedDelimiter -Path $CsvPath
+}
+
+Write-Log "Starting import. CSV: $CsvPath"
+Write-Log ("Delimiter detected/used: '{0}'" -f ($CsvDelimiter -replace "`t", "\t"))
+Write-Log "WhatIfMode=$WhatIfMode | AllowClearing=$AllowClearing | UpdateMailAttr=$UpdateMailAttr | UpdateProxyAddrs=$UpdateProxyAddrs | UpdateManager=$UpdateManager"
+
+$rows = Import-Csv -Path $CsvPath -Delimiter $CsvDelimiter
+$rows = @($rows)
+
+if (-not $rows -or $rows.Count -eq 0) {
+    Write-Log "IMPORT FAILED: CSV is empty or could not be parsed: $CsvPath" "ERROR"
+    Write-Host ""
+    Write-Host "IMPORT FAILED: The CSV file is empty (or could not be parsed):" -ForegroundColor Yellow
+    Write-Host "  $CsvPath" -ForegroundColor Yellow
+    Write-Host ""
+    return
+}
+
+$rowCount = $rows.Count
+if ($rowCount -lt 1) { $rowCount = 1 }
+
+# Build header map (trimmed header -> actual property name)
+$HeaderMap = @{}
+foreach ($p in $rows[0].PSObject.Properties.Name) {
+    $trim = ($p.Trim())
+    if (-not $HeaderMap.ContainsKey($trim)) { $HeaderMap[$trim] = $p }
+}
+
+function Csv-HasColumn {
+    param([string]$Name)
+    return $HeaderMap.ContainsKey($Name)
+}
+
+function Get-CsvValue {
+    param(
+        [pscustomobject]$Row,
+        [string]$ColumnName
+    )
+    if (-not (Csv-HasColumn $ColumnName)) { return "" }
+    $actual = $HeaderMap[$ColumnName]
+    return Normalize-String $Row.$actual
+}
+
+# Validate identity columns exist in header
+$hasAnyIdColumn = (Csv-HasColumn 'SamAccountName') -or (Csv-HasColumn 'UPN') -or (Csv-HasColumn 'Email')
+if (-not $hasAnyIdColumn) {
+    $found = ($rows[0].PSObject.Properties.Name | Sort-Object) -join ", "
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Yellow
+    Write-Host "IMPORT FAILED: Missing identity columns" -ForegroundColor Yellow
+    Write-Host "========================================" -ForegroundColor Yellow
+    Write-Host "Expected at least one of these columns in the CSV header:" -ForegroundColor Yellow
+    Write-Host "  SamAccountName, UPN, Email" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Columns found in your file:" -ForegroundColor Yellow
+    Write-Host "  $found" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Most common cause: wrong CSV delimiter (Excel often saves with ';' in DK)." -ForegroundColor Yellow
+    Write-Host ("Delimiter used was: '{0}'" -f ($CsvDelimiter -replace "`t", "\t")) -ForegroundColor Yellow
+    Write-Host ""
+    Write-Log "IMPORT FAILED: No identity columns found. ColumnsFound=[$found]" "ERROR"
+    return
+}
+
 function Resolve-TargetUser {
     param([pscustomobject]$Row)
 
     foreach ($key in $IdentityMatchOrder) {
-        $val = Normalize-String $Row.$key
+        $val = Get-CsvValue -Row $Row -ColumnName $key
         if ([string]::IsNullOrWhiteSpace($val)) { continue }
 
         try {
@@ -142,10 +283,10 @@ function Resolve-TargetUser {
 }
 
 function Resolve-ManagerDn {
-    param([pscustomobject]$Row, [hashtable]$HeaderSet)
+    param([pscustomobject]$Row)
 
-    if ($HeaderSet.ContainsKey('Manager Email')) {
-        $mgrEmail = Normalize-String $Row.'Manager Email'
+    if (Csv-HasColumn 'Manager Email') {
+        $mgrEmail = Get-CsvValue -Row $Row -ColumnName 'Manager Email'
         if (-not [string]::IsNullOrWhiteSpace($mgrEmail)) {
             $m = Get-ADUser -Filter "mail -eq '$mgrEmail'" -Properties DistinguishedName -ErrorAction SilentlyContinue
             if ($m) { return $m.DistinguishedName }
@@ -153,8 +294,8 @@ function Resolve-ManagerDn {
         }
     }
 
-    if ($HeaderSet.ContainsKey('Manager')) {
-        $mgrName = Normalize-String $Row.'Manager'
+    if (Csv-HasColumn 'Manager') {
+        $mgrName = Get-CsvValue -Row $Row -ColumnName 'Manager'
         if (-not [string]::IsNullOrWhiteSpace($mgrName)) {
             $cands = Get-ADUser -Filter "DisplayName -eq '$mgrName'" -Properties DistinguishedName -ErrorAction SilentlyContinue
             if ($cands.Count -eq 1) { return $cands[0].DistinguishedName }
@@ -184,7 +325,6 @@ function Ensure-ProxyAddresses {
         }
 
         $desiredPrimary = "SMTP:$primaryEmail"
-
         $newList = $newList | ForEach-Object {
             if ($_.ToLowerInvariant() -eq ("smtp:$primaryEmail")) { $desiredPrimary } else { $_ }
         }
@@ -213,84 +353,6 @@ function Ensure-ProxyAddresses {
 }
 
 # -----------------------------
-# Friendly CSV path validation (no stack trace)
-# -----------------------------
-$ResolvedCsvPath = $null
-try { $ResolvedCsvPath = (Resolve-Path -Path $CsvPath -ErrorAction Stop).Path } catch { }
-
-if (-not $ResolvedCsvPath -or -not (Test-Path -Path $ResolvedCsvPath -PathType Leaf)) {
-
-    $cwd = (Get-Location).Path
-
-    Write-Host ""
-    Write-Host "========================================" -ForegroundColor Yellow
-    Write-Host "IMPORT FAILED: CSV file not found" -ForegroundColor Yellow
-    Write-Host "========================================" -ForegroundColor Yellow
-    Write-Host "The script expected this CSV file:" -ForegroundColor Yellow
-    Write-Host "  $CsvPath" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "Current working folder:" -ForegroundColor Yellow
-    Write-Host "  $cwd" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "Tips:" -ForegroundColor Yellow
-    Write-Host "  - If you use a relative path like .\file.csv, it is relative to the working folder above."
-    Write-Host "  - Try setting CsvPath to a full path, e.g. C:\Scripts\ExportADinfo\file.csv"
-    Write-Host ""
-
-    $candidates = Get-ChildItem -Path $cwd -Filter "*.csv" -File -ErrorAction SilentlyContinue |
-                  Sort-Object LastWriteTime -Descending |
-                  Select-Object -First 10
-
-    if ($candidates) {
-        Write-Host "CSV files found in the working folder (newest first):" -ForegroundColor Yellow
-        foreach ($c in $candidates) {
-            Write-Host ("  {0}  ({1})" -f $c.Name, $c.LastWriteTime) -ForegroundColor Yellow
-        }
-        Write-Host ""
-    } else {
-        Write-Host "No CSV files were found in the working folder." -ForegroundColor Yellow
-        Write-Host ""
-    }
-
-    try { Write-Log "IMPORT FAILED: CSV file not found: $CsvPath (WorkingFolder: $cwd)" "ERROR" } catch { }
-
-    Write-Host "Stopping. Fix CsvPath and run again." -ForegroundColor Yellow
-    Write-Host ""
-    return
-}
-
-$CsvPath = $ResolvedCsvPath
-
-# -----------------------------
-# Load CSV
-# -----------------------------
-Write-Log "Starting import. CSV: $CsvPath"
-Write-Log "WhatIfMode=$WhatIfMode | AllowClearing=$AllowClearing | UpdateMailAttr=$UpdateMailAttr | UpdateProxyAddrs=$UpdateProxyAddrs | UpdateManager=$UpdateManager"
-
-$rows = Import-Csv -Path $CsvPath
-$rows = @($rows)
-if (-not $rows -or $rows.Count -eq 0) {
-    Write-Log "IMPORT FAILED: CSV is empty: $CsvPath" "ERROR"
-    Write-Host ""
-    Write-Host "IMPORT FAILED: The CSV file is empty:" -ForegroundColor Yellow
-    Write-Host "  $CsvPath" -ForegroundColor Yellow
-    Write-Host ""
-    return
-}
-
-$rowCount = $rows.Count
-if ($rowCount -lt 1) { $rowCount = 1 }
-
-# Build header set
-$HeaderSet = @{}
-$rows[0].PSObject.Properties.Name | ForEach-Object { $HeaderSet[$_] = $true }
-
-function Csv-HasColumn {
-    param([string]$Name)
-    return $HeaderSet.ContainsKey($Name)
-}
-
-# -----------------------------
 # Import loop
 # -----------------------------
 $processed = 0
@@ -302,9 +364,9 @@ $errors    = 0
 foreach ($r in $rows) {
     $processed++
 
-    $idDisplay = Normalize-String $r.SamAccountName
-    if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = Normalize-String $r.UPN }
-    if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = Normalize-String $r.Email }
+    $idDisplay = Get-CsvValue -Row $r -ColumnName 'SamAccountName'
+    if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = Get-CsvValue -Row $r -ColumnName 'UPN' }
+    if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = Get-CsvValue -Row $r -ColumnName 'Email' }
     if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = "(no id in row)" }
 
     $pct = [int](($processed / $rowCount) * 100)
@@ -319,7 +381,7 @@ foreach ($r in $rows) {
         if (-not $u) {
             $skipped++
             Write-Log "User not found in AD for row identity: $idDisplay" "WARN"
-            Add-ChangeRow -SamAccountName (Normalize-String $r.SamAccountName) -UPN (Normalize-String $r.UPN) -Attribute "(identity)" -OldValue "" -NewValue "" -Action "Skip" -Status "NotFound" -Note "No matching AD user"
+            Add-ChangeRow -SamAccountName (Get-CsvValue -Row $r -ColumnName 'SamAccountName') -UPN (Get-CsvValue -Row $r -ColumnName 'UPN') -Attribute "(identity)" -OldValue "" -NewValue "" -Action "Skip" -Status "NotFound" -Note "No matching AD user"
             continue
         }
 
@@ -382,7 +444,7 @@ foreach ($r in $rows) {
         foreach ($m in $map) {
             if (-not (Csv-HasColumn $m.Csv)) { continue }
 
-            $csvVal = Normalize-String $r.($m.Csv)
+            $csvVal = Get-CsvValue -Row $r -ColumnName $m.Csv
             $adVal  = Normalize-String $u.($m.Ad)
 
             if ([string]::IsNullOrWhiteSpace($csvVal)) {
@@ -399,8 +461,9 @@ foreach ($r in $rows) {
             }
         }
 
+        # otherTelephone
         if (Csv-HasColumn 'Other phones') {
-            $csvOtherPhones = Split-SemicolonList (Normalize-String $r.'Other phones')
+            $csvOtherPhones = Split-SemicolonList (Get-CsvValue -Row $r -ColumnName 'Other phones')
             $adOtherPhones  = @()
             if ($u.otherTelephone) { $adOtherPhones = @($u.otherTelephone) }
 
@@ -418,8 +481,9 @@ foreach ($r in $rows) {
             }
         }
 
+        # mail
         $csvEmail = ""
-        if (Csv-HasColumn 'Email') { $csvEmail = Normalize-String $r.Email }
+        if (Csv-HasColumn 'Email') { $csvEmail = Get-CsvValue -Row $r -ColumnName 'Email' }
 
         if ($UpdateMailAttr -and (Csv-HasColumn 'Email')) {
             if (-not [string]::IsNullOrWhiteSpace($csvEmail)) {
@@ -434,6 +498,7 @@ foreach ($r in $rows) {
             }
         }
 
+        # proxyAddresses
         $proxyRelevant = (Csv-HasColumn 'Email') -or (Csv-HasColumn 'ProxyAddresses')
         if ($UpdateProxyAddrs -and $proxyRelevant) {
             $existingProxies = @()
@@ -441,7 +506,7 @@ foreach ($r in $rows) {
 
             $csvProxies = @()
             if ($AddCsvProxyAddrs -and (Csv-HasColumn 'ProxyAddresses')) {
-                $csvProxies = Split-SemicolonList (Normalize-String $r.ProxyAddresses)
+                $csvProxies = Split-SemicolonList (Get-CsvValue -Row $r -ColumnName 'ProxyAddresses')
             }
 
             $newProxies = Ensure-ProxyAddresses -Existing $existingProxies -PrimaryEmail $csvEmail -CsvProxyAddresses $csvProxies
@@ -455,9 +520,10 @@ foreach ($r in $rows) {
             }
         }
 
+        # manager
         $mgrRelevant = (Csv-HasColumn 'Manager') -or (Csv-HasColumn 'Manager Email')
         if ($UpdateManager -and $mgrRelevant) {
-            $mgrDn = Resolve-ManagerDn -Row $r -HeaderSet $HeaderSet
+            $mgrDn = Resolve-ManagerDn -Row $r
             if ($mgrDn) {
                 $oldMgr = Normalize-String $u.manager
                 if ($mgrDn -ne $oldMgr) {
@@ -505,23 +571,4 @@ foreach ($r in $rows) {
     catch {
         $errors++
         Write-Log "Error processing $idDisplay : $($_.Exception.Message)" "ERROR"
-        Add-ChangeRow -SamAccountName (Normalize-String $r.SamAccountName) -UPN (Normalize-String $r.UPN) -Attribute "(row)" -OldValue "" -NewValue "" -Action "Error" -Status "Failed" -Note $($_.Exception.Message)
-    }
-}
-
-Write-Progress -Activity "Importing users" -Completed
-
-if ($changeRows.Count -gt 0) {
-    $changeRows | Export-Csv -Path $LogCsvPath -NoTypeInformation -Encoding UTF8
-} else {
-    "Timestamp,SamAccountName,UPN,Attribute,OldValue,NewValue,Action,Status,Note" | Set-Content -Path $LogCsvPath -Encoding UTF8
-}
-
-Write-Log "Run complete."
-Write-Log "Processed : $processed"
-Write-Log "Matched   : $matched"
-Write-Log "Updated   : $updated"
-Write-Log "Skipped   : $skipped"
-Write-Log "Errors    : $errors"
-Write-Log "Log (text): $LogTextPath"
-Write-Log "Log (csv) : $LogCsvPath"
+        Add-ChangeRow -SamAccountName (Get-CsvValue -Row $r -ColumnName 'SamAccountName') -UPN (Get-CsvValue -Row $r -ColumnName 'UPN') -Attribute "(row)" -OldValue "" -NewValue "" -Acti
