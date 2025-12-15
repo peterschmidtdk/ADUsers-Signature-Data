@@ -12,7 +12,7 @@
 .NOTES
     Author  : Peter
     Script  : Import-ADUsers-SignatureData.ps1
-    Version : 1.2
+    Version : 1.3
     Updated : 2025-12-15
     Output  : Defaults to .\
 
@@ -117,9 +117,7 @@ function Resolve-TargetUser {
                     if ($u) { return $u }
                 }
             }
-        } catch {
-            # try next match type
-        }
+        } catch { }
     }
     return $null
 }
@@ -207,11 +205,9 @@ $rows = Import-Csv -Path $CsvPath
 $rows = @($rows)  # ensure array even for single-row CSV
 if (-not $rows -or $rows.Count -eq 0) { throw "CSV is empty: $CsvPath" }
 
-# rowCount safe for progress calculation
 $rowCount = $rows.Count
 if ($rowCount -lt 1) { $rowCount = 1 }
 
-# Build CSV header set (case-insensitive)
 $HeaderSet = @{}
 $rows[0].PSObject.Properties.Name | ForEach-Object { $HeaderSet[$_] = $true }
 
@@ -241,7 +237,7 @@ foreach ($r in $rows) {
     if ($pct -gt 100) { $pct = 100 }
     if ($pct -lt 0)   { $pct = 0 }
 
-    Write-Progress -Activity "Importing users" -Status "Processing $processed / $rowCount: $idDisplay" -PercentComplete $pct
+    Write-Progress -Activity "Importing users" -Status ("Processing {0} / {1}: {2}" -f $processed, $rowCount, $idDisplay) -PercentComplete $pct
     Write-Log "Processing: $idDisplay"
 
     try {
