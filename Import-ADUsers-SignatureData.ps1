@@ -1,20 +1,30 @@
 <#
 .SYNOPSIS
-    Import AD user profile fields from a CSV (same format as Export-ADUsers-SignatureData) and update only what changed.
+    Import script that updates AD user signature/profile attributes from a CSV exported by Export-ADUsers-SignatureData.ps1
+    (typically edited in Excel) for use with email signature solutions (e.g., CodeTwo Signatures and similar tools).
 
 .DESCRIPTION
+    This script is designed to work together with the companion export script:
+      - Export-ADUsers-SignatureData.ps1  -> exports AD user attributes to CSV for signature/profile management
+      - Import-ADUsers-SignatureData.ps1  -> imports the same CSV format back and updates AD
+
+    Typical workflow:
+      1) Run Export-ADUsers-SignatureData.ps1 to generate a CSV
+      2) Edit the CSV in Excel (department, title, phone, address, ExchAttr1-15, etc.)
+      3) Run this script to apply ONLY the needed changes back to AD
+
     Safety rule:
       - Only touches attributes that have a matching column PRESENT in the CSV headers.
       - If a column is NOT in the CSV, that attribute is left unchanged.
-    By default:
-      - Does NOT clear attributes when CSV value is blank ($AllowClearing = $false).
+      - By default, blank CSV values do NOT clear AD attributes ($AllowClearing = $false).
+
     Logging:
-      - Writes a timestamped .log and a detailed change .csv (planned/applied/failed).
+      - Writes a timestamped .log and a detailed change .csv (planned/applied/failed) for traceability.
 
 .NOTES
     Author  : Peter
     Script  : Import-ADUsers-SignatureData.ps1
-    Version : 1.4
+    Version : 1.5
     Updated : 2025-12-15
     Output  : Defaults to .\Logs (for logs)
 
@@ -116,9 +126,7 @@ function Resolve-TargetUser {
 
         try {
             switch ($key) {
-                'SamAccountName' {
-                    return (Get-ADUser -Identity $val -Properties * -ErrorAction Stop)
-                }
+                'SamAccountName' { return (Get-ADUser -Identity $val -Properties * -ErrorAction Stop) }
                 'UPN' {
                     $u = Get-ADUser -Filter "UserPrincipalName -eq '$val'" -Properties * -ErrorAction Stop
                     if ($u) { return $u }
@@ -169,7 +177,6 @@ function Ensure-ProxyAddresses {
 
     $primaryEmail = (Normalize-String $PrimaryEmail).ToLowerInvariant()
 
-    # Ensure only ONE primary SMTP, and it matches Email (if Email column exists/provided)
     if (-not [string]::IsNullOrWhiteSpace($primaryEmail)) {
         $newList = @()
         foreach ($p in $existingList) {
@@ -178,12 +185,10 @@ function Ensure-ProxyAddresses {
 
         $desiredPrimary = "SMTP:$primaryEmail"
 
-        # If desired exists as smtp:, promote it
         $newList = $newList | ForEach-Object {
             if ($_.ToLowerInvariant() -eq ("smtp:$primaryEmail")) { $desiredPrimary } else { $_ }
         }
 
-        # Ensure desired primary exists
         if (-not ($newList | Where-Object { $_.ToLowerInvariant() -eq $desiredPrimary.ToLowerInvariant() })) {
             $newList += $desiredPrimary
         }
@@ -191,7 +196,6 @@ function Ensure-ProxyAddresses {
         $existingList = $newList
     }
 
-    # Add any CSV proxies (never remove)
     foreach ($p in $CsvProxyAddresses) {
         $pp = Normalize-String $p
         if ([string]::IsNullOrWhiteSpace($pp)) { continue }
@@ -202,7 +206,6 @@ function Ensure-ProxyAddresses {
         }
     }
 
-    # De-dupe case-insensitive
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $deduped = foreach ($p in $existingList) { if ($seen.Add($p)) { $p } }
 
@@ -265,7 +268,7 @@ Write-Log "Starting import. CSV: $CsvPath"
 Write-Log "WhatIfMode=$WhatIfMode | AllowClearing=$AllowClearing | UpdateMailAttr=$UpdateMailAttr | UpdateProxyAddrs=$UpdateProxyAddrs | UpdateManager=$UpdateManager"
 
 $rows = Import-Csv -Path $CsvPath
-$rows = @($rows)  # ensure array even for single-row CSV
+$rows = @($rows)
 if (-not $rows -or $rows.Count -eq 0) {
     Write-Log "IMPORT FAILED: CSV is empty: $CsvPath" "ERROR"
     Write-Host ""
@@ -278,7 +281,7 @@ if (-not $rows -or $rows.Count -eq 0) {
 $rowCount = $rows.Count
 if ($rowCount -lt 1) { $rowCount = 1 }
 
-# Build CSV header set
+# Build header set
 $HeaderSet = @{}
 $rows[0].PSObject.Properties.Name | ForEach-Object { $HeaderSet[$_] = $true }
 
@@ -327,7 +330,6 @@ foreach ($r in $rows) {
         $planSetManager = $false
         $mgrDn = $null
 
-        # Map CSV columns -> AD attribute names (ONLY if column exists)
         $map = @(
             @{ Csv='First Name';     Ad='givenName' },
             @{ Csv='Last Name';      Ad='sn' },
@@ -397,7 +399,6 @@ foreach ($r in $rows) {
             }
         }
 
-        # otherTelephone (multi-valued) only if column exists
         if (Csv-HasColumn 'Other phones') {
             $csvOtherPhones = Split-SemicolonList (Normalize-String $r.'Other phones')
             $adOtherPhones  = @()
@@ -417,7 +418,6 @@ foreach ($r in $rows) {
             }
         }
 
-        # Email / mail only if Email column exists
         $csvEmail = ""
         if (Csv-HasColumn 'Email') { $csvEmail = Normalize-String $r.Email }
 
@@ -434,7 +434,6 @@ foreach ($r in $rows) {
             }
         }
 
-        # proxyAddresses only if Email/ProxyAddresses columns exist
         $proxyRelevant = (Csv-HasColumn 'Email') -or (Csv-HasColumn 'ProxyAddresses')
         if ($UpdateProxyAddrs -and $proxyRelevant) {
             $existingProxies = @()
@@ -456,7 +455,6 @@ foreach ($r in $rows) {
             }
         }
 
-        # manager only if relevant columns exist
         $mgrRelevant = (Csv-HasColumn 'Manager') -or (Csv-HasColumn 'Manager Email')
         if ($UpdateManager -and $mgrRelevant) {
             $mgrDn = Resolve-ManagerDn -Row $r -HeaderSet $HeaderSet
@@ -486,7 +484,6 @@ foreach ($r in $rows) {
             continue
         }
 
-        # Apply Replace/Clear
         if ($replace.Count -gt 0 -or $clear.Count -gt 0) {
             $params = @{ Identity = $u.DistinguishedName; ErrorAction = 'Stop' }
             if ($replace.Count -gt 0) { $params['Replace'] = $replace }
@@ -494,7 +491,6 @@ foreach ($r in $rows) {
             Set-ADUser @params
         }
 
-        # Apply Manager
         if ($planSetManager -and $mgrDn) {
             Set-ADUser -Identity $u.DistinguishedName -Manager $mgrDn -ErrorAction Stop
         }
@@ -515,18 +511,12 @@ foreach ($r in $rows) {
 
 Write-Progress -Activity "Importing users" -Completed
 
-# -----------------------------
-# Write change CSV
-# -----------------------------
 if ($changeRows.Count -gt 0) {
     $changeRows | Export-Csv -Path $LogCsvPath -NoTypeInformation -Encoding UTF8
 } else {
     "Timestamp,SamAccountName,UPN,Attribute,OldValue,NewValue,Action,Status,Note" | Set-Content -Path $LogCsvPath -Encoding UTF8
 }
 
-# -----------------------------
-# Summary
-# -----------------------------
 Write-Log "Run complete."
 Write-Log "Processed : $processed"
 Write-Log "Matched   : $matched"
