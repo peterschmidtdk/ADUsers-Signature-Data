@@ -3,7 +3,6 @@
     Import AD user profile fields from a CSV (same format as Export-ADUsers-SignatureData) and update only what changed.
 
 .DESCRIPTION
-    Reads a CSV with the same headers produced by the export script and updates corresponding AD attributes.
     Safety rule:
       - Only touches attributes that have a matching column PRESENT in the CSV headers.
       - If a column is NOT in the CSV, that attribute is left unchanged.
@@ -13,7 +12,7 @@
 .NOTES
     Author  : Peter
     Script  : Import-ADUsers-SignatureData.ps1
-    Version : 1.1
+    Version : 1.2
     Updated : 2025-12-15
     Output  : Defaults to .\
 
@@ -108,9 +107,7 @@ function Resolve-TargetUser {
 
         try {
             switch ($key) {
-                'SamAccountName' {
-                    return (Get-ADUser -Identity $val -Properties * -ErrorAction Stop)
-                }
+                'SamAccountName' { return (Get-ADUser -Identity $val -Properties * -ErrorAction Stop) }
                 'UPN' {
                     $u = Get-ADUser -Filter "UserPrincipalName -eq '$val'" -Properties * -ErrorAction Stop
                     if ($u) { return $u }
@@ -163,10 +160,8 @@ function Ensure-ProxyAddresses {
 
     $primaryEmail = (Normalize-String $PrimaryEmail).ToLowerInvariant()
 
-    # Ensure one primary SMTP matches PrimaryEmail (if provided)
     if (-not [string]::IsNullOrWhiteSpace($primaryEmail)) {
         $newList = @()
-
         foreach ($p in $existingList) {
             if ($p -like 'SMTP:*') { $newList += ('smtp:' + ($p.Substring(5))) }
             else { $newList += $p }
@@ -184,11 +179,9 @@ function Ensure-ProxyAddresses {
         $existingList = $newList
     }
 
-    # Add any CSV proxies (never remove)
     foreach ($p in $CsvProxyAddresses) {
         $pp = Normalize-String $p
         if ([string]::IsNullOrWhiteSpace($pp)) { continue }
-
         if ($pp -notmatch '^(?i)smtp:') { $pp = "smtp:$pp" }
 
         if (-not ($existingList | Where-Object { $_.ToLowerInvariant() -eq $pp.ToLowerInvariant() })) {
@@ -196,7 +189,6 @@ function Ensure-ProxyAddresses {
         }
     }
 
-    # De-dupe case-insensitive
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $deduped = foreach ($p in $existingList) { if ($seen.Add($p)) { $p } }
 
@@ -212,7 +204,12 @@ Write-Log "Starting import. CSV: $CsvPath"
 Write-Log "WhatIfMode=$WhatIfMode | AllowClearing=$AllowClearing | UpdateMailAttr=$UpdateMailAttr | UpdateProxyAddrs=$UpdateProxyAddrs | UpdateManager=$UpdateManager"
 
 $rows = Import-Csv -Path $CsvPath
+$rows = @($rows)  # ensure array even for single-row CSV
 if (-not $rows -or $rows.Count -eq 0) { throw "CSV is empty: $CsvPath" }
+
+# rowCount safe for progress calculation
+$rowCount = $rows.Count
+if ($rowCount -lt 1) { $rowCount = 1 }
 
 # Build CSV header set (case-insensitive)
 $HeaderSet = @{}
@@ -240,7 +237,11 @@ foreach ($r in $rows) {
     if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = Normalize-String $r.Email }
     if ([string]::IsNullOrWhiteSpace($idDisplay)) { $idDisplay = "(no id in row)" }
 
-    Write-Progress -Activity "Importing users" -Status "Processing $processed / $($rows.Count): $idDisplay" -PercentComplete ([int](($processed / $rows.Count) * 100))
+    $pct = [int](($processed / $rowCount) * 100)
+    if ($pct -gt 100) { $pct = 100 }
+    if ($pct -lt 0)   { $pct = 0 }
+
+    Write-Progress -Activity "Importing users" -Status "Processing $processed / $rowCount: $idDisplay" -PercentComplete $pct
     Write-Log "Processing: $idDisplay"
 
     try {
@@ -257,8 +258,8 @@ foreach ($r in $rows) {
         $replace = @{}
         $clear   = @()
         $planSetManager = $false
+        $mgrDn = $null
 
-        # Map CSV columns -> AD attribute names (ONLY applied if column exists in CSV)
         $map = @(
             @{ Csv='First Name';     Ad='givenName' },
             @{ Csv='Last Name';      Ad='sn' },
@@ -309,7 +310,7 @@ foreach ($r in $rows) {
         )
 
         foreach ($m in $map) {
-            if (-not (Csv-HasColumn $m.Csv)) { continue }  # <-- key safety rule
+            if (-not (Csv-HasColumn $m.Csv)) { continue }
 
             $csvVal = Normalize-String $r.($m.Csv)
             $adVal  = Normalize-String $u.($m.Ad)
@@ -328,7 +329,6 @@ foreach ($r in $rows) {
             }
         }
 
-        # otherTelephone only if column exists
         if (Csv-HasColumn 'Other phones') {
             $csvOtherPhones = Split-SemicolonList (Normalize-String $r.'Other phones')
             $adOtherPhones  = @()
@@ -349,7 +349,6 @@ foreach ($r in $rows) {
             }
         }
 
-        # mail only if Email column exists
         $csvEmail = ""
         if (Csv-HasColumn 'Email') { $csvEmail = Normalize-String $r.Email }
 
@@ -367,7 +366,6 @@ foreach ($r in $rows) {
             }
         }
 
-        # proxyAddresses only if relevant column(s) exist
         $proxyRelevant = (Csv-HasColumn 'Email') -or (Csv-HasColumn 'ProxyAddresses')
         if ($UpdateProxyAddrs -and $proxyRelevant) {
             $existingProxies = @()
@@ -389,9 +387,7 @@ foreach ($r in $rows) {
             }
         }
 
-        # manager only if Manager or Manager Email columns exist
         $mgrRelevant = (Csv-HasColumn 'Manager') -or (Csv-HasColumn 'Manager Email')
-        $mgrDn = $null
         if ($UpdateManager -and $mgrRelevant) {
             $mgrDn = Resolve-ManagerDn -Row $r -HeaderSet $HeaderSet
             if ($mgrDn) {
