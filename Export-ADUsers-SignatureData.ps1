@@ -10,7 +10,7 @@
 .NOTES
     Author  : Peter
     Script  : Export-ADUsers-SignatureData.ps1
-    Version : 1.3
+    Version : 1.4
     Updated : 2025-12-15
     Output  : Defaults to .\
 
@@ -24,7 +24,7 @@
 $OU               = "OU=MyBusiness,DC=contoso,DC=local"
 $OutputDirectory  = ".\"
 $IncludeDisabled  = $false            # set $true to include disabled accounts
-$IncludeNoEmail   = $false            # set $true to include users without mail attribute
+$IncludeNoEmail   = $false            # set $true to include users without mail/primary SMTP
 $ExportPhotos     = $false            # set $true to export thumbnailPhoto to files (NOT into CSV)
 $PhotoFolder      = Join-Path $OutputDirectory "AD_UserPhotos"
 
@@ -41,7 +41,6 @@ if ($ExportPhotos -and -not (Test-Path $PhotoFolder)) {
     New-Item -Path $PhotoFolder -ItemType Directory -Force | Out-Null
 }
 
-# Timestamped filename (adds time to avoid overwriting)
 $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $OutFile   = Join-Path $OutputDirectory "AD_Users_SignatureData_Export_$Timestamp.csv"
 
@@ -78,6 +77,19 @@ $props = @(
     "Enabled"
 )
 
+# Column order (also used to write header if no rows export)
+$Columns = @(
+    "SamAccountName","UPN","Display Name","First Name","Last Name","Initials","Email","ProxyAddresses",
+    "Company","Department","Office","Position","Description","Notes",
+    "Street","P.O. Box","City","State","Postal code","Country (c)","Country (co)",
+    "Phone","Other phones","Mobile","IP phone","Home phone","Fax","Pager","Web page",
+    "Manager","Manager Email","Manager Title","Manager Phone","Manager Mobile",
+    "ExchAttr1","ExchAttr2","ExchAttr3","ExchAttr4","ExchAttr5","ExchAttr6","ExchAttr7","ExchAttr8","ExchAttr9","ExchAttr10",
+    "ExchAttr11","ExchAttr12","ExchAttr13","ExchAttr14","ExchAttr15",
+    "EmployeeID","EmployeeNumber","EmployeeType",
+    "Enabled","HasPhoto"
+)
+
 # Cache manager lookups (performance)
 $mgrCache = @{}
 
@@ -86,9 +98,7 @@ function Get-ManagerDetails {
 
     if ([string]::IsNullOrWhiteSpace($ManagerDn)) { return $null }
 
-    if ($mgrCache.ContainsKey($ManagerDn)) {
-        return $mgrCache[$ManagerDn]
-    }
+    if ($mgrCache.ContainsKey($ManagerDn)) { return $mgrCache[$ManagerDn] }
 
     try {
         $m = Get-ADUser -Identity $ManagerDn -Properties DisplayName,mail,Title,telephoneNumber,mobile
@@ -108,30 +118,74 @@ function Get-ManagerDetails {
     return $obj
 }
 
+function Get-PrimarySmtpFromProxyAddresses {
+    param([string[]]$ProxyAddresses)
+
+    if (-not $ProxyAddresses) { return "" }
+
+    # Primary SMTP is typically the one with uppercase "SMTP:"
+    $primary = $ProxyAddresses | Where-Object { $_ -like "SMTP:*" } | Select-Object -First 1
+    if ($primary) { return ($primary -replace "^SMTP:", "") }
+
+    # Fallback: first smtp:
+    $fallback = $ProxyAddresses | Where-Object { $_ -like "smtp:*" } | Select-Object -First 1
+    if ($fallback) { return ($fallback -replace "^smtp:", "") }
+
+    return ""
+}
+
 # -----------------------------
 # Export
 # -----------------------------
-$users = Get-ADUser -Filter * -SearchBase $OU -Properties $props
+Write-Host "Loading users from OU: $OU"
 
-if (-not $IncludeDisabled) {
-    $users = $users | Where-Object { $_.Enabled -eq $true }
-}
+$allUsers = Get-ADUser -Filter * -SearchBase $OU -Properties $props
+$totalFound = @($allUsers).Count
 
-if (-not $IncludeNoEmail) {
-    $users = $users | Where-Object { -not [string]::IsNullOrWhiteSpace($_.mail) }
-}
+# Count skips for visibility
+$disabledCount = @($allUsers | Where-Object { $_.Enabled -ne $true }).Count
+$enabledUsers  = if ($IncludeDisabled) { $allUsers } else { $allUsers | Where-Object { $_.Enabled -eq $true } }
 
-$export = foreach ($u in $users) {
+Write-Host "Total users found        : $totalFound"
+Write-Host "Disabled users in OU     : $disabledCount"
+Write-Host "IncludeDisabled          : $IncludeDisabled"
+Write-Host "IncludeNoEmail           : $IncludeNoEmail"
+
+$exportList = New-Object System.Collections.Generic.List[object]
+
+$enabledCount = @($enabledUsers).Count
+$skippedNoEmail = 0
+
+for ($i = 0; $i -lt $enabledCount; $i++) {
+    $u = $enabledUsers[$i]
+
+    $who = if ($u.DisplayName) { $u.DisplayName } else { $u.SamAccountName }
+    $pct = if ($enabledCount -gt 0) { [int](($i + 1) / $enabledCount * 100) } else { 100 }
+
+    Write-Progress -Activity "Exporting AD users" -Status "[$($i+1)/$enabledCount] $who" -PercentComplete $pct
+
     $mgr = Get-ManagerDetails -ManagerDn $u.manager
 
+    # Determine Email: prefer mail, else primary SMTP from proxyAddresses
+    $primarySmtp = ""
+    if (-not [string]::IsNullOrWhiteSpace($u.mail)) {
+        $primarySmtp = $u.mail
+    } else {
+        $primarySmtp = Get-PrimarySmtpFromProxyAddresses -ProxyAddresses $u.proxyAddresses
+    }
+
+    if (-not $IncludeNoEmail -and [string]::IsNullOrWhiteSpace($primarySmtp)) {
+        $skippedNoEmail++
+        continue
+    }
+
     if ($ExportPhotos -and $u.thumbnailPhoto) {
-        # Save as JPG file (best-effort). Some orgs store JPEG data in thumbnailPhoto.
         $safeName  = ($u.SamAccountName -replace '[^a-zA-Z0-9._-]', '_')
         $photoPath = Join-Path $PhotoFolder "$safeName.jpg"
         try { [System.IO.File]::WriteAllBytes($photoPath, $u.thumbnailPhoto) } catch { }
     }
 
-    [pscustomobject]@{
+    $exportList.Add([pscustomobject]@{
         # Identity
         "SamAccountName" = $u.SamAccountName
         "UPN"            = $u.UserPrincipalName
@@ -139,7 +193,7 @@ $export = foreach ($u in $users) {
         "First Name"     = $u.GivenName
         "Last Name"      = $u.Surname
         "Initials"       = $u.Initials
-        "Email"          = $u.mail
+        "Email"          = $primarySmtp
         "ProxyAddresses" = if ($u.proxyAddresses) { ($u.proxyAddresses -join ";") } else { "" }
 
         # Org
@@ -201,9 +255,28 @@ $export = foreach ($u in $users) {
         # Status
         "Enabled"        = $u.Enabled
         "HasPhoto"       = [bool]$u.thumbnailPhoto
-    }
+    })
 }
 
-$export | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
+Write-Progress -Activity "Exporting AD users" -Completed
+
+$exportedCount = $exportList.Count
+$skippedDisabled = if ($IncludeDisabled) { 0 } else { $disabledCount }
+
+# If nothing exported, still create a CSV with headers (so it's not empty/0 bytes)
+if ($exportedCount -eq 0) {
+    ($Columns -join ",") | Set-Content -Path $OutFile -Encoding UTF8
+    Write-Warning "No users were exported. A header-only CSV was created."
+} else {
+    $exportList | Select-Object $Columns | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
+}
+
+Write-Host ""
 Write-Host "Export complete: $OutFile"
-if ($ExportPhotos) { Write-Host "Photos folder: $PhotoFolder" }
+Write-Host "Summary:"
+Write-Host "  Total found in OU      : $totalFound"
+Write-Host "  Considered (after disabled filter): $enabledCount"
+Write-Host "  Exported               : $exportedCount"
+Write-Host "  Skipped (disabled)     : $skippedDisabled"
+Write-Host "  Skipped (no email)     : $skippedNoEmail"
+if ($ExportPhotos) { Write-Host "  Photos folder          : $PhotoFolder" }
