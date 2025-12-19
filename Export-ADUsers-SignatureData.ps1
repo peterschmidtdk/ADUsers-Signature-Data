@@ -10,7 +10,7 @@
 .NOTES
     Author  : Peter
     Script  : Export-ADUsers-SignatureData.ps1
-    Version : 1.4
+    Version : 1.6
     Updated : 2025-12-15
     Output  : Defaults to .\
 
@@ -41,53 +41,54 @@ if ($ExportPhotos -and -not (Test-Path $PhotoFolder)) {
     New-Item -Path $PhotoFolder -ItemType Directory -Force | Out-Null
 }
 
+# Timestamped filename (adds time to avoid overwriting)
 $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $OutFile   = Join-Path $OutputDirectory "AD_Users_SignatureData_Export_$Timestamp.csv"
 
 # Properties used by signature placeholders (AD attributes behind them)
 $props = @(
     # Identity / routing
-    "SamAccountName","UserPrincipalName","DisplayName","GivenName","Surname","Initials",
-    "mail","proxyAddresses",
+    'SamAccountName','UserPrincipalName','DisplayName','GivenName','Surname','Initials',
+    'mail','proxyAddresses',
 
     # Org / role
-    "Company","Department","Title","Description","Info","physicalDeliveryOfficeName",
+    'Company','Department','Title','Description','Info','physicalDeliveryOfficeName',
 
     # Address
-    "streetAddress","postOfficeBox","l","st","postalCode","c","co",
+    'streetAddress','postOfficeBox','l','st','postalCode','c','co',
 
     # Phones / web
-    "telephoneNumber","otherTelephone","mobile","ipPhone","homePhone","facsimileTelephoneNumber","pager","wWWHomePage",
+    'telephoneNumber','otherTelephone','mobile','ipPhone','homePhone','facsimileTelephoneNumber','pager','wWWHomePage',
 
     # Manager
-    "manager",
+    'manager',
 
     # Exchange custom attributes (ExchAttr1-15)
-    "extensionAttribute1","extensionAttribute2","extensionAttribute3","extensionAttribute4","extensionAttribute5",
-    "extensionAttribute6","extensionAttribute7","extensionAttribute8","extensionAttribute9","extensionAttribute10",
-    "extensionAttribute11","extensionAttribute12","extensionAttribute13","extensionAttribute14","extensionAttribute15",
+    'extensionAttribute1','extensionAttribute2','extensionAttribute3','extensionAttribute4','extensionAttribute5',
+    'extensionAttribute6','extensionAttribute7','extensionAttribute8','extensionAttribute9','extensionAttribute10',
+    'extensionAttribute11','extensionAttribute12','extensionAttribute13','extensionAttribute14','extensionAttribute15',
 
     # Optional useful IDs
-    "employeeID","employeeNumber","employeeType",
+    'employeeID','employeeNumber','employeeType',
 
     # Photo presence
-    "thumbnailPhoto",
+    'thumbnailPhoto',
 
     # Status
-    "Enabled"
+    'Enabled'
 )
 
 # Column order (also used to write header if no rows export)
 $Columns = @(
-    "SamAccountName","UPN","Display Name","First Name","Last Name","Initials","Email","ProxyAddresses",
-    "Company","Department","Office","Position","Description","Notes",
-    "Street","P.O. Box","City","State","Postal code","Country (c)","Country (co)",
-    "Phone","Other phones","Mobile","IP phone","Home phone","Fax","Pager","Web page",
-    "Manager","Manager Email","Manager Title","Manager Phone","Manager Mobile",
-    "ExchAttr1","ExchAttr2","ExchAttr3","ExchAttr4","ExchAttr5","ExchAttr6","ExchAttr7","ExchAttr8","ExchAttr9","ExchAttr10",
-    "ExchAttr11","ExchAttr12","ExchAttr13","ExchAttr14","ExchAttr15",
-    "EmployeeID","EmployeeNumber","EmployeeType",
-    "Enabled","HasPhoto"
+    'SamAccountName','UPN','Display Name','First Name','Last Name','Initials','Email','ProxyAddresses',
+    'Company','Department','Office','Position','Description','Notes',
+    'Street','P.O. Box','City','State','Postal code','Country (c)','Country (co)',
+    'Phone','Other phones','Mobile','IP phone','Home phone','Fax','Pager','Web page',
+    'Manager','Manager Email','Manager Title','Manager Phone','Manager Mobile',
+    'ExchAttr1','ExchAttr2','ExchAttr3','ExchAttr4','ExchAttr5','ExchAttr6','ExchAttr7','ExchAttr8','ExchAttr9','ExchAttr10',
+    'ExchAttr11','ExchAttr12','ExchAttr13','ExchAttr14','ExchAttr15',
+    'EmployeeID','EmployeeNumber','EmployeeType',
+    'Enabled','HasPhoto'
 )
 
 # Cache manager lookups (performance)
@@ -124,12 +125,12 @@ function Get-PrimarySmtpFromProxyAddresses {
     if (-not $ProxyAddresses) { return "" }
 
     # Primary SMTP is typically the one with uppercase "SMTP:"
-    $primary = $ProxyAddresses | Where-Object { $_ -like "SMTP:*" } | Select-Object -First 1
-    if ($primary) { return ($primary -replace "^SMTP:", "") }
+    $primary = $ProxyAddresses | Where-Object { $_ -like 'SMTP:*' } | Select-Object -First 1
+    if ($primary) { return ($primary -replace '^SMTP:', '') }
 
     # Fallback: first smtp:
-    $fallback = $ProxyAddresses | Where-Object { $_ -like "smtp:*" } | Select-Object -First 1
-    if ($fallback) { return ($fallback -replace "^smtp:", "") }
+    $fallback = $ProxyAddresses | Where-Object { $_ -like 'smtp:*' } | Select-Object -First 1
+    if ($fallback) { return ($fallback -replace '^smtp:', '') }
 
     return ""
 }
@@ -139,39 +140,47 @@ function Get-PrimarySmtpFromProxyAddresses {
 # -----------------------------
 Write-Host "Loading users from OU: $OU"
 
-$allUsers = Get-ADUser -Filter * -SearchBase $OU -Properties $props
-$totalFound = @($allUsers).Count
+try {
+    $allUsers = Get-ADUser -Filter * -SearchBase $OU -Properties $props -ErrorAction Stop
+}
+catch {
+    Write-Error "Failed to query AD users from SearchBase '$OU'. Error: $($_.Exception.Message)"
+    throw
+}
 
-# Count skips for visibility
+$totalFound = @($allUsers).Count
 $disabledCount = @($allUsers | Where-Object { $_.Enabled -ne $true }).Count
-$enabledUsers  = if ($IncludeDisabled) { $allUsers } else { $allUsers | Where-Object { $_.Enabled -eq $true } }
 
 Write-Host "Total users found        : $totalFound"
 Write-Host "Disabled users in OU     : $disabledCount"
 Write-Host "IncludeDisabled          : $IncludeDisabled"
 Write-Host "IncludeNoEmail           : $IncludeNoEmail"
+Write-Host "ExportPhotos             : $ExportPhotos"
+Write-Host ""
+
+$usersToProcess = if ($IncludeDisabled) { $allUsers } else { $allUsers | Where-Object { $_.Enabled -eq $true } }
+$usersToProcess = @($usersToProcess)
+$toProcessCount = $usersToProcess.Count
 
 $exportList = New-Object System.Collections.Generic.List[object]
-
-$enabledCount = @($enabledUsers).Count
 $skippedNoEmail = 0
 
-for ($i = 0; $i -lt $enabledCount; $i++) {
-    $u = $enabledUsers[$i]
+for ($i = 0; $i -lt $toProcessCount; $i++) {
+    $u = $usersToProcess[$i]
 
     $who = if ($u.DisplayName) { $u.DisplayName } else { $u.SamAccountName }
-    $pct = if ($enabledCount -gt 0) { [int](($i + 1) / $enabledCount * 100) } else { 100 }
+    $pct = if ($toProcessCount -gt 0) { [int](($i + 1) / $toProcessCount * 100) } else { 100 }
 
-    Write-Progress -Activity "Exporting AD users" -Status "[$($i+1)/$enabledCount] $who" -PercentComplete $pct
+    Write-Progress -Activity "Exporting AD users" -Status "[$($i+1)/$toProcessCount] $who" -PercentComplete $pct
+    Write-Host ("[{0}/{1}] {2}" -f ($i+1), $toProcessCount, $who)
 
     $mgr = Get-ManagerDetails -ManagerDn $u.manager
 
     # Determine Email: prefer mail, else primary SMTP from proxyAddresses
-    $primarySmtp = ""
-    if (-not [string]::IsNullOrWhiteSpace($u.mail)) {
-        $primarySmtp = $u.mail
+    $primarySmtp = if (-not [string]::IsNullOrWhiteSpace($u.mail)) {
+        $u.mail
     } else {
-        $primarySmtp = Get-PrimarySmtpFromProxyAddresses -ProxyAddresses $u.proxyAddresses
+        Get-PrimarySmtpFromProxyAddresses -ProxyAddresses $u.proxyAddresses
     }
 
     if (-not $IncludeNoEmail -and [string]::IsNullOrWhiteSpace($primarySmtp)) {
@@ -187,74 +196,74 @@ for ($i = 0; $i -lt $enabledCount; $i++) {
 
     $exportList.Add([pscustomobject]@{
         # Identity
-        "SamAccountName" = $u.SamAccountName
-        "UPN"            = $u.UserPrincipalName
-        "Display Name"   = $u.DisplayName
-        "First Name"     = $u.GivenName
-        "Last Name"      = $u.Surname
-        "Initials"       = $u.Initials
-        "Email"          = $primarySmtp
-        "ProxyAddresses" = if ($u.proxyAddresses) { ($u.proxyAddresses -join ";") } else { "" }
+        'SamAccountName' = $u.SamAccountName
+        'UPN'            = $u.UserPrincipalName
+        'Display Name'   = $u.DisplayName
+        'First Name'     = $u.GivenName
+        'Last Name'      = $u.Surname
+        'Initials'       = $u.Initials
+        'Email'          = $primarySmtp
+        'ProxyAddresses' = if ($u.proxyAddresses) { ($u.proxyAddresses -join ';') } else { '' }
 
         # Org
-        "Company"        = $u.Company
-        "Department"     = $u.Department
-        "Office"         = $u.physicalDeliveryOfficeName
-        "Position"       = $u.Title
-        "Description"    = $u.Description
-        "Notes"          = $u.Info
+        'Company'        = $u.Company
+        'Department'     = $u.Department
+        'Office'         = $u.physicalDeliveryOfficeName
+        'Position'       = $u.Title
+        'Description'    = $u.Description
+        'Notes'          = $u.Info
 
         # Address
-        "Street"         = $u.streetAddress
-        "P.O. Box"       = $u.postOfficeBox
-        "City"           = $u.l
-        "State"          = $u.st
-        "Postal code"    = $u.postalCode
-        "Country (c)"    = $u.c
-        "Country (co)"   = $u.co
+        'Street'         = $u.streetAddress
+        'P.O. Box'       = $u.postOfficeBox
+        'City'           = $u.l
+        'State'          = $u.st
+        'Postal code'    = $u.postalCode
+        'Country (c)'    = $u.c
+        'Country (co)'   = $u.co
 
         # Phones / web
-        "Phone"          = $u.telephoneNumber
-        "Other phones"   = if ($u.otherTelephone) { ($u.otherTelephone -join ";") } else { "" }
-        "Mobile"         = $u.mobile
-        "IP phone"       = $u.ipPhone
-        "Home phone"     = $u.homePhone
-        "Fax"            = $u.facsimileTelephoneNumber
-        "Pager"          = $u.pager
-        "Web page"       = $u.wWWHomePage
+        'Phone'          = $u.telephoneNumber
+        'Other phones'   = if ($u.otherTelephone) { ($u.otherTelephone -join ';') } else { '' }
+        'Mobile'         = $u.mobile
+        'IP phone'       = $u.ipPhone
+        'Home phone'     = $u.homePhone
+        'Fax'            = $u.facsimileTelephoneNumber
+        'Pager'          = $u.pager
+        'Web page'       = $u.wWWHomePage
 
         # Manager
-        "Manager"        = $mgr.DisplayName
-        "Manager Email"  = $mgr.Email
-        "Manager Title"  = $mgr.Title
-        "Manager Phone"  = $mgr.Phone
-        "Manager Mobile" = $mgr.Mobile
+        'Manager'        = $mgr.DisplayName
+        'Manager Email'  = $mgr.Email
+        'Manager Title'  = $mgr.Title
+        'Manager Phone'  = $mgr.Phone
+        'Manager Mobile' = $mgr.Mobile
 
         # ExchAttr1-15
-        "ExchAttr1"      = $u.extensionAttribute1
-        "ExchAttr2"      = $u.extensionAttribute2
-        "ExchAttr3"      = $u.extensionAttribute3
-        "ExchAttr4"      = $u.extensionAttribute4
-        "ExchAttr5"      = $u.extensionAttribute5
-        "ExchAttr6"      = $u.extensionAttribute6
-        "ExchAttr7"      = $u.extensionAttribute7
-        "ExchAttr8"      = $u.extensionAttribute8
-        "ExchAttr9"      = $u.extensionAttribute9
-        "ExchAttr10"     = $u.extensionAttribute10
-        "ExchAttr11"     = $u.extensionAttribute11
-        "ExchAttr12"     = $u.extensionAttribute12
-        "ExchAttr13"     = $u.extensionAttribute13
-        "ExchAttr14"     = $u.extensionAttribute14
-        "ExchAttr15"     = $u.extensionAttribute15
+        'ExchAttr1'      = $u.extensionAttribute1
+        'ExchAttr2'      = $u.extensionAttribute2
+        'ExchAttr3'      = $u.extensionAttribute3
+        'ExchAttr4'      = $u.extensionAttribute4
+        'ExchAttr5'      = $u.extensionAttribute5
+        'ExchAttr6'      = $u.extensionAttribute6
+        'ExchAttr7'      = $u.extensionAttribute7
+        'ExchAttr8'      = $u.extensionAttribute8
+        'ExchAttr9'      = $u.extensionAttribute9
+        'ExchAttr10'     = $u.extensionAttribute10
+        'ExchAttr11'     = $u.extensionAttribute11
+        'ExchAttr12'     = $u.extensionAttribute12
+        'ExchAttr13'     = $u.extensionAttribute13
+        'ExchAttr14'     = $u.extensionAttribute14
+        'ExchAttr15'     = $u.extensionAttribute15
 
         # Optional IDs
-        "EmployeeID"     = $u.employeeID
-        "EmployeeNumber" = $u.employeeNumber
-        "EmployeeType"   = $u.employeeType
+        'EmployeeID'     = $u.employeeID
+        'EmployeeNumber' = $u.employeeNumber
+        'EmployeeType'   = $u.employeeType
 
         # Status
-        "Enabled"        = $u.Enabled
-        "HasPhoto"       = [bool]$u.thumbnailPhoto
+        'Enabled'        = $u.Enabled
+        'HasPhoto'       = [bool]$u.thumbnailPhoto
     })
 }
 
@@ -263,10 +272,10 @@ Write-Progress -Activity "Exporting AD users" -Completed
 $exportedCount = $exportList.Count
 $skippedDisabled = if ($IncludeDisabled) { 0 } else { $disabledCount }
 
-# If nothing exported, still create a CSV with headers (so it's not empty/0 bytes)
+# If nothing exported, still create a CSV with headers
 if ($exportedCount -eq 0) {
-    ($Columns -join ",") | Set-Content -Path $OutFile -Encoding UTF8
-    Write-Warning "No users were exported. A header-only CSV was created."
+    ($Columns -join ',') | Set-Content -Path $OutFile -Encoding UTF8
+    Write-Warning "No users were exported. A header-only CSV was created: $OutFile"
 } else {
     $exportList | Select-Object $Columns | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
 }
@@ -274,9 +283,9 @@ if ($exportedCount -eq 0) {
 Write-Host ""
 Write-Host "Export complete: $OutFile"
 Write-Host "Summary:"
-Write-Host "  Total found in OU      : $totalFound"
-Write-Host "  Considered (after disabled filter): $enabledCount"
-Write-Host "  Exported               : $exportedCount"
-Write-Host "  Skipped (disabled)     : $skippedDisabled"
-Write-Host "  Skipped (no email)     : $skippedNoEmail"
-if ($ExportPhotos) { Write-Host "  Photos folder          : $PhotoFolder" }
+Write-Host "  Total found in OU                  : $totalFound"
+Write-Host "  Considered (after disabled filter) : $toProcessCount"
+Write-Host "  Exported                           : $exportedCount"
+Write-Host "  Skipped (disabled)                 : $skippedDisabled"
+Write-Host "  Skipped (no email)                 : $skippedNoEmail"
+if ($ExportPhotos) { Write-Host "  Photos folder                      : $PhotoFolder" }
