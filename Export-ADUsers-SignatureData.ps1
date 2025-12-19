@@ -1,16 +1,16 @@
 <#
 .SYNOPSIS
-    Export AD user profile fields for CodeTwo email signature use (address/contact + ExchAttr1-15 + manager info).
+    Export AD user profile fields for email signature use (address/contact + ExchAttr1-15 + manager info).
 
 .DESCRIPTION
-    Exports common CodeTwo placeholder fields from on-prem AD users in a specific OU to CSV.
+    Exports common signature placeholder fields from on-prem AD users in a specific OU to CSV.
     Includes address fields, phone fields, webpage, and Exchange custom attributes (ExchAttr1-15),
     plus manager display name/email/title/phones.
 
 .NOTES
     Author  : Peter
-    Script  : Export-ADUsers-CodeTwo.ps1
-    Version : 1.2
+    Script  : Export-ADUsers-SignatureData.ps1
+    Version : 1.3
     Updated : 2025-12-15
     Output  : Defaults to .\
 
@@ -43,9 +43,9 @@ if ($ExportPhotos -and -not (Test-Path $PhotoFolder)) {
 
 # Timestamped filename (adds time to avoid overwriting)
 $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-$OutFile   = Join-Path $OutputDirectory "AD_Users_CodeTwo_Export_$Timestamp.csv"
+$OutFile   = Join-Path $OutputDirectory "AD_Users_SignatureData_Export_$Timestamp.csv"
 
-# Properties used by CodeTwo-like placeholders (AD attributes behind them)
+# Properties used by signature placeholders (AD attributes behind them)
 $props = @(
     # Identity / routing
     "SamAccountName","UserPrincipalName","DisplayName","GivenName","Surname","Initials",
