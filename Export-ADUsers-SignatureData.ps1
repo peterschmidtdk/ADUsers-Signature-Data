@@ -8,9 +8,9 @@
     plus manager display name/email/title/phones.
 
 .NOTES
-    Author  : Peter Schmidt (msdigest.net)
-    Script  : Export-ADUsers-SignatureData.ps1
-    Version : 1.1
+    Author  : Peter
+    Script  : Export-ADUsers-CodeTwo.ps1
+    Version : 1.2
     Updated : 2025-12-15
     Output  : Defaults to .\
 
@@ -21,7 +21,7 @@
 # -----------------------------
 # Config
 # -----------------------------
-$OU               = "OU=MyBusiness,DC=contoso,DC=local" #Update with OU to export from
+$OU               = "OU=MyBusiness,DC=contoso,DC=local"
 $OutputDirectory  = ".\"
 $IncludeDisabled  = $false            # set $true to include disabled accounts
 $IncludeNoEmail   = $false            # set $true to include users without mail attribute
@@ -41,8 +41,9 @@ if ($ExportPhotos -and -not (Test-Path $PhotoFolder)) {
     New-Item -Path $PhotoFolder -ItemType Directory -Force | Out-Null
 }
 
-$DateStamp = Get-Date -Format "yyyy-MM-dd"
-$OutFile   = Join-Path $OutputDirectory "AD_Users_CodeTwo_Export_$DateStamp.csv"
+# Timestamped filename (adds time to avoid overwriting)
+$Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$OutFile   = Join-Path $OutputDirectory "AD_Users_CodeTwo_Export_$Timestamp.csv"
 
 # Properties used by CodeTwo-like placeholders (AD attributes behind them)
 $props = @(
@@ -125,7 +126,7 @@ $export = foreach ($u in $users) {
 
     if ($ExportPhotos -and $u.thumbnailPhoto) {
         # Save as JPG file (best-effort). Some orgs store JPEG data in thumbnailPhoto.
-        $safeName = ($u.SamAccountName -replace '[^a-zA-Z0-9._-]', '_')
+        $safeName  = ($u.SamAccountName -replace '[^a-zA-Z0-9._-]', '_')
         $photoPath = Join-Path $PhotoFolder "$safeName.jpg"
         try { [System.IO.File]::WriteAllBytes($photoPath, $u.thumbnailPhoto) } catch { }
     }
@@ -206,4 +207,3 @@ $export = foreach ($u in $users) {
 $export | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
 Write-Host "Export complete: $OutFile"
 if ($ExportPhotos) { Write-Host "Photos folder: $PhotoFolder" }
-
